@@ -201,6 +201,19 @@ public:
     // Solutions found / leg count of the most recent run_relay() (probe and test use).
     uint32_t relay_found() const { return relay_found_; }
     uint32_t relay_legs_run() const { return relay_legs_; }
+#if defined(FASTBP_TEST_RELAY_DUMP) && FASTBP_TEST_RELAY_DUMP
+    // Test build only (never shipped; the macro is set only by the relay unit-exactness build):
+    // the single-leg dump of the relay unit-exactness test.  window_off() makes the fused column
+    // pass keep its messages in d.b2c instead of the block's shared window, so the run's messages
+    // can be read back; set_gamma() uploads a fixed gamma / (1 - gamma) pair; run_leg() runs exactly
+    // one leg (leg 0's input marginals, the priors) of max_iter iterations; read() copies the final
+    // messages in CSC edge order and the final marginals to the caller.  All with the handle's own
+    // kernels and arithmetic; the helpers only choose storage and copy.
+    bool relay_test_window_off();
+    bool relay_test_set_gamma(const double *gamma, const double *omg);
+    uint32_t relay_test_run_leg(const uint8_t *syn01, uint32_t max_iter);
+    bool relay_test_read(uint32_t parity, double *msg_csc, double *post);
+#endif
     // Copy the last shot's posteriors into posterior[] (device -> host) if they are not there yet.
     // Returns false on a CUDA failure; true when posterior[] is valid.
     bool fetch_posterior();

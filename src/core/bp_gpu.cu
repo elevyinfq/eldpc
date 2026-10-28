@@ -5044,4 +5044,83 @@ bool Engine::fetch_posterior() {
     return true;
 }
 
+
+#if defined(FASTBP_TEST_RELAY_DUMP) && FASTBP_TEST_RELAY_DUMP
+// Test build only (never shipped; see bp_engine.hpp): the unit-exactness helpers.
+//
+// The messages of one leg are read back from the handle's own b2c array after a run whose last
+// column pass did not write them: a run of T + 1 iterations leaves nu(T) in b2c (iteration T's
+// column pass wrote it; iteration T + 1 is the cap's mismatch-only pass) and M(T) in the parity
+// buffer of iteration T.  The interleaved layout stores the messages by ILV slot, so a gather
+// kernel puts them in CSC edge order -- the reference's order -- before the copy.
+__global__ void relay_gather_b2c_kernel(const double *b2c, const uint32_t *cperm, const uint32_t *cptr,
+                                        double *out, uint32_t n, uint32_t ilv) {
+    const uint32_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    if (ilv == 0u) {
+        for (uint32_t k = cptr[p]; k < cptr[p + 1]; ++k) out[k] = b2c[k];
+        return;
+    }
+    const uint32_t col = cperm[p];
+    const uint32_t b = cptr[col], e = cptr[col + 1];
+    uint32_t s = ilv_slot0(p);
+    for (uint32_t k = b; k < e && k < b + (uint32_t)kRegDeg; ++k, s += 32u) out[k] = b2c[s];
+}
+
+bool Engine::relay_test_window_off() {
+    GpuState *g = gpu_;
+    if (!g || !g->relay) return false;
+    g->win_rounds = 0u;   // the same values, kept in d.b2c instead of the block's shared window
+    return true;
+}
+
+bool Engine::relay_test_set_gamma(const double *gamma, const double *omg) {
+    GpuState *g = gpu_;
+    if (!g || !g->relay || gamma == nullptr || omg == nullptr) return false;
+    try {
+        CK(cudaMemcpyAsync(g->d_gamma, gamma, (size_t)g->n * 8, cudaMemcpyHostToDevice, g->stream));
+        CK(cudaMemcpyAsync(g->d_omg, omg, (size_t)g->n * 8, cudaMemcpyHostToDevice, g->stream));
+        CK(cudaStreamSynchronize(g->stream));
+    } catch (const std::exception &) {
+        return false;
+    }
+    return true;
+}
+
+uint32_t Engine::relay_test_run_leg(const uint8_t *syn01, uint32_t max_iter) {
+    posterior_valid = false;
+    relay_ran_ = true;
+    const uint32_t it = relay_leg_launch(syn01, max_iter, gpu_->d_prior, 1.0);
+    last_post_parity = (gpu_->sum_mode == 1) ? (it & 1u) : 0u;
+    return it;
+}
+
+bool Engine::relay_test_read(uint32_t parity, double *msg_csc, double *post) {
+    GpuState *g = gpu_;
+    if (!g) return false;
+    double *tmp = nullptr;
+    try {
+        if (msg_csc != nullptr && g->nnz > 0) {
+            CK(cudaMalloc(&tmp, (size_t)g->nnz * 8));
+            relay_gather_b2c_kernel<<<(g->n + 255u) / 256u, 256, 0, g->stream>>>(
+                g->d_b2c, g->d_cperm, g->d_cptr, tmp, g->n, (uint32_t)g->ilv);
+            CK(cudaGetLastError());
+            CK(cudaMemcpyAsync(msg_csc, tmp, (size_t)g->nnz * 8, cudaMemcpyDeviceToHost, g->stream));
+            CK(cudaStreamSynchronize(g->stream));
+            CK(cudaFree(tmp));
+            tmp = nullptr;
+        }
+        if (post != nullptr) {
+            const double *src = (g->sum_mode == 1 && (parity & 1u) != 0u) ? g->d_post2 : g->d_post;
+            CK(cudaMemcpyAsync(post, src, (size_t)g->n * 8, cudaMemcpyDeviceToHost, g->stream));
+            CK(cudaStreamSynchronize(g->stream));
+        }
+    } catch (const std::exception &) {
+        if (tmp) cudaFree(tmp);
+        return false;
+    }
+    return true;
+}
+#endif  // FASTBP_TEST_RELAY_DUMP
+
 }  // namespace fastbp

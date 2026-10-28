@@ -1112,6 +1112,47 @@ DBENCH_EXPORT int fastbp_keep_warm(dbench_decoder *h, uint32_t flags) {
     return DBENCH_OK;
 }
 
+#if defined(FASTBP_TEST_RELAY_DUMP) && FASTBP_TEST_RELAY_DUMP
+// Test build only (never shipped): one Relay-BP leg of max_iter iterations with a caller-given
+// gamma pair and the leg's input marginals equal to the priors, followed by the dump of the
+// messages nu(max_iter - 1) in CSC edge order and the marginals M(max_iter - 1) (see
+// bp_engine.hpp).  Used by tools/relay/t_relay_unit.py against the CPU reference; no I/O, no state
+// outside the handle.
+DBENCH_EXPORT int fastbp_test_relay_leg(dbench_decoder *h, const uint8_t *syndrome, uint32_t max_iter,
+                                        const double *gamma, const double *omg, uint32_t parity,
+                                        double *out_msg, double *out_post, uint32_t *out_iters) {
+    if (h == nullptr || syndrome == nullptr || gamma == nullptr || omg == nullptr ||
+        out_msg == nullptr || out_post == nullptr || out_iters == nullptr || max_iter < 1u) {
+        return DBENCH_EINVAL;
+    }
+    try {
+        if (!h->engine.relay_test_window_off()) return DBENCH_EINTERNAL;
+        if (!h->engine.relay_test_set_gamma(gamma, omg)) return DBENCH_EINTERNAL;
+        *out_iters = h->engine.relay_test_run_leg(syndrome, max_iter);
+        if (!h->engine.relay_test_read(parity, out_msg, out_post)) return DBENCH_EINTERNAL;
+    } catch (...) {
+        return DBENCH_EINTERNAL;
+    }
+    return DBENCH_OK;
+}
+
+// Test build only (never shipped): the counters of the most recent Relay-BP decode --
+// converged solutions found, legs run, message-passing iterations summed over the legs.  The status
+// word carries the iteration count; the leg count is not an ABI output, so the LER-cell tool reads it
+// here, from the same decode.  Returns EINVAL for a handle whose config is not relay > 0.
+DBENCH_EXPORT int fastbp_test_relay_stats(dbench_decoder *h, uint32_t *out_found, uint32_t *out_legs,
+                                         uint32_t *out_iters) {
+    if (h == nullptr || out_found == nullptr || out_legs == nullptr || out_iters == nullptr) {
+        return DBENCH_EINVAL;
+    }
+    if (h->cfg.relay <= 0) return DBENCH_EINVAL;
+    *out_found = h->engine.relay_found();
+    *out_legs = h->engine.relay_legs_run();
+    *out_iters = h->engine.relay_iterations();
+    return DBENCH_OK;
+}
+#endif
+
 #if defined(FASTBP_TEST_LAYOUT_PROBE) && FASTBP_TEST_LAYOUT_PROBE
 // Test-only build (never shipped: the macro is set only by the layout-probe builds): the
 // handle's create-time layout record (fastbp::LayoutStats) as u32 words into the caller's buffer.  Returns the
