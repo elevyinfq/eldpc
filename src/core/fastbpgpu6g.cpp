@@ -52,6 +52,18 @@ struct Config {
     double ms_scaling_factor = 0.625;
     ldpc::osd::OsdMethod osd_method = ldpc::osd::OSD_0;
     int osd_order = 0;
+    // Relay-BP, a second operating point of a decoder=bp handle.  relay = S, the
+    // number of converged solutions the decoder collects before it stops (0: the mode is off and the
+    // library decodes exactly as without the mode).  The rest are qLDPC's defaults for the mode (gamma0 0.1, pre_iter 80,
+    // num_sets 300, set_max_iter 60) plus the gross code's disordered interval [-0.24, 0.66].
+    int relay = 0;
+    int relay_legs = 300;
+    int relay_pre_iter = 80;
+    int relay_set_iter = 60;
+    double relay_gamma0 = 0.1;
+    double relay_gamma_lo = -0.24;
+    double relay_gamma_hi = 0.66;
+    unsigned long long relay_seed = 0;
 };
 
 // ---- config string parsing (identical rules to ldpc-ref) -----------
@@ -136,7 +148,9 @@ bool parse_float_value(const std::string &v, double &out) {
 bool build_config(const std::map<std::string, std::string> &kv, Config &cfg, std::string &err) {
     static const char *const kKeys[] = {"decoder",   "bp_method",  "max_iter",   "ms_scaling_factor",
                                         "schedule",  "osd_method", "osd_order",  "lsd_method",
-                                        "lsd_order"};
+                                        "lsd_order", "relay",      "relay_legs", "relay_pre_iter",
+                                        "relay_set_iter", "relay_gamma0", "relay_gamma_lo",
+                                        "relay_gamma_hi", "relay_seed"};
     for (const auto &it : kv) {
         bool known = false;
         for (const char *k : kKeys) {
@@ -192,6 +206,94 @@ bool build_config(const std::map<std::string, std::string> &kv, Config &cfg, std
     }
     cfg.max_iter = static_cast<int>(mi_val);
 
+    // Relay-BP: the mode's own key, relay = S (the number of converged solutions to
+    // collect).  Its companion keys configure the legs; they are refused when the mode is off, as the
+    // osd_* keys are on a decoder=bp handle.
+    if (kv.count("relay")) {
+        long long v = 0;
+        if (!parse_int_value(kv.at("relay"), 0, 65535, v)) {
+            err = "invalid relay '" + kv.at("relay") + "' (expected an integer in 0..65535)";
+            return false;
+        }
+        cfg.relay = static_cast<int>(v);
+    }
+    {
+        static const char *const kRelayKeys[] = {"relay_legs", "relay_pre_iter", "relay_set_iter",
+                                                 "relay_gamma0", "relay_gamma_lo", "relay_gamma_hi",
+                                                 "relay_seed"};
+        bool any = false;
+        for (const char *k : kRelayKeys) any = any || kv.count(k) != 0;
+        if (any && cfg.relay <= 0) {
+            err = "config key 'relay_*' does not apply without relay > 0";
+            return false;
+        }
+    }
+    if (cfg.relay > 0 && cfg.kind != Kind::kBp) {
+        err = "relay > 0 requires decoder=bp (Relay-BP has no OSD post-processing)";
+        return false;
+    }
+    if (kv.count("relay_legs")) {
+        long long v = 0;
+        if (!parse_int_value(kv.at("relay_legs"), 1, 1000000, v)) {
+            err = "invalid relay_legs '" + kv.at("relay_legs") + "' (expected an integer in 1..1000000)";
+            return false;
+        }
+        cfg.relay_legs = static_cast<int>(v);
+    }
+    if (kv.count("relay_pre_iter")) {
+        long long v = 0;
+        if (!parse_int_value(kv.at("relay_pre_iter"), 1, 1000000, v)) {
+            err = "invalid relay_pre_iter '" + kv.at("relay_pre_iter") +
+                  "' (expected an integer in 1..1000000)";
+            return false;
+        }
+        cfg.relay_pre_iter = static_cast<int>(v);
+    }
+    if (kv.count("relay_set_iter")) {
+        long long v = 0;
+        if (!parse_int_value(kv.at("relay_set_iter"), 1, 1000000, v)) {
+            err = "invalid relay_set_iter '" + kv.at("relay_set_iter") +
+                  "' (expected an integer in 1..1000000)";
+            return false;
+        }
+        cfg.relay_set_iter = static_cast<int>(v);
+    }
+    if (kv.count("relay_gamma0")) {
+        double g = 0.0;
+        if (!parse_float_value(kv.at("relay_gamma0"), g)) {
+            err = "invalid relay_gamma0 '" + kv.at("relay_gamma0") + "' (expected a finite float)";
+            return false;
+        }
+        cfg.relay_gamma0 = g;
+    }
+    if (kv.count("relay_gamma_lo") != 0 || kv.count("relay_gamma_hi") != 0) {
+        double lo = cfg.relay_gamma_lo, hi = cfg.relay_gamma_hi;
+        if (kv.count("relay_gamma_lo") && !parse_float_value(kv.at("relay_gamma_lo"), lo)) {
+            err = "invalid relay_gamma_lo '" + kv.at("relay_gamma_lo") + "' (expected a finite float)";
+            return false;
+        }
+        if (kv.count("relay_gamma_hi") && !parse_float_value(kv.at("relay_gamma_hi"), hi)) {
+            err = "invalid relay_gamma_hi '" + kv.at("relay_gamma_hi") + "' (expected a finite float)";
+            return false;
+        }
+        if (!(lo <= hi)) {
+            err = "relay_gamma_lo must be <= relay_gamma_hi";
+            return false;
+        }
+        cfg.relay_gamma_lo = lo;
+        cfg.relay_gamma_hi = hi;
+    }
+    if (kv.count("relay_seed")) {
+        long long v = 0;
+        if (!parse_int_value(kv.at("relay_seed"), 0, 9000000000000000000ll, v)) {
+            err = "invalid relay_seed '" + kv.at("relay_seed") + "' (expected an integer >= 0)";
+            return false;
+        }
+        cfg.relay_seed = static_cast<unsigned long long>(v);
+    }
+    // The paper's min-sum has no normalization: a relay config's scaling factor defaults to 1, not
+    // to the library's 0.625.  An explicit ms_scaling_factor still wins (a tested operating point).
+    if (cfg.relay > 0) cfg.ms_scaling_factor = 1.0;
     if (kv.count("ms_scaling_factor")) {
         double msf = 0.0;
         if (!parse_float_value(kv.at("ms_scaling_factor"), msf) || !(msf > 0.0)) {
@@ -500,6 +602,44 @@ int decode_one(dbench_decoder *h, const uint8_t *syndrome, uint8_t *out_correcti
     }
 
     try {
+        // The Relay-BP operating point.  Everything the ordinary path does for a
+        // decoder=bp shot happens here too -- the correction, O x, the status word -- but the decode
+        // is the leg loop of Engine::run_relay(): each leg is this library's min-sum kernel with the
+        // memory bias, legs hand their final marginals over on the device, and the decoder returns
+        // the lowest-weight of the solutions it found.  A shot with no converged solution returns the
+        // last leg's hard decision, flagged SYNDROME_UNMATCHED, exactly as a plain BP shot does; the
+        // iteration count is all legs' iterations together.
+        if (h->cfg.relay > 0) {
+            fastbp::RelaySpec spec;
+            spec.stop_nconv = (uint32_t)h->cfg.relay;
+            spec.max_legs = (uint32_t)h->cfg.relay_legs;
+            spec.pre_iter = (uint32_t)h->cfg.relay_pre_iter;
+            spec.set_iter = (uint32_t)h->cfg.relay_set_iter;
+            spec.gamma0 = h->cfg.relay_gamma0;
+            spec.gamma_lo = h->cfg.relay_gamma_lo;
+            spec.gamma_hi = h->cfg.relay_gamma_hi;
+            spec.seed = h->cfg.relay_seed;
+            spec.alpha = h->cfg.ms_scaling_factor;
+            DBENCH_STAGE(DBENCH_STAGE_BP_BEGIN);
+            const uint32_t found = h->engine.run_relay(syndrome, spec);
+            DBENCH_STAGE(DBENCH_STAGE_BP_END);
+            const uint32_t iterations = h->engine.relay_iterations();
+            const uint8_t *corr = h->engine.decoding;
+            const uint32_t flags = (found > 0u) ? DBENCH_ST_BP_CONVERGED : DBENCH_ST_SYNDROME_UNMATCHED;
+            if (out_correction != nullptr && n > 0 && corr != out_correction) {
+                std::memcpy(out_correction, corr, n);
+            }
+            compute_obs(h, corr, out_obs);
+            DBENCH_STAGE(DBENCH_STAGE_OBS);
+            if (out_status != nullptr) {
+                uint32_t it = iterations > DBENCH_ST_ITER_MAX ? DBENCH_ST_ITER_MAX : iterations;
+                *out_status = (flags & DBENCH_ST_FLAGS_MASK) | (it << DBENCH_ST_ITER_SHIFT);
+            }
+            h->last_shot_zero = false;
+            h->last_decode_ok = true;
+            DBENCH_STAGE(DBENCH_STAGE_RET);
+            return DBENCH_OK;
+        }
         // An OSD-0 handle hands the caller's syndrome
         // bytes to the engine and to the walk directly -- both mask every byte with & 1 themselves
         // (Engine::run's parameter pack and h_syn staging; Osd0Engine's pack_syndrome), which is exactly
@@ -811,7 +951,8 @@ DBENCH_EXPORT dbench_decoder *dbench_create(const char *config, const dbench_pro
         }
 
         const bool own_osd0 = (h->cfg.kind == Kind::kBpOsd && h->cfg.osd_method == ldpc::osd::OSD_0);
-        if (!h->engine.setup(m, n, problem->h_colptr, problem->h_rowind, own_osd0)) {
+        if (!h->engine.setup(m, n, problem->h_colptr, problem->h_rowind, own_osd0, true,
+                             cfg.relay > 0)) {
             set_err(err, err_len, fail("create failed: engine setup").c_str());
             delete h;
             return nullptr;

@@ -104,6 +104,23 @@ struct LayoutStats {
     uint32_t reserved[4];
 };
 
+// Relay-BP: the parameters of one Relay-BP decode (the paper's Relay-BP-S).  They come from
+// the handle's config; nothing here changes between shots but the syndrome.  gamma0 is leg 0's
+// uniform memory strength; every later leg draws gamma_j independently and uniformly from
+// [gamma_lo, gamma_hi]; leg 0 runs up to pre_iter iterations, every later leg up to set_iter; the
+// decoder stops once stop_nconv converged solutions were found or max_legs legs ran.
+struct RelaySpec {
+    uint32_t stop_nconv = 1;
+    uint32_t max_legs = 300;
+    uint32_t pre_iter = 80;
+    uint32_t set_iter = 60;
+    double gamma0 = 0.1;
+    double gamma_lo = -0.24;
+    double gamma_hi = 0.66;
+    unsigned long long seed = 0;
+    double alpha = 1.0;
+};
+
 // The engine as the ABI glue sees it: the interface of the CPU engine it replaces.
 class Engine {
 public:
@@ -158,8 +175,10 @@ public:
     // library's own OSD-0 on non-converged shots.  Only such a handle builds the device-side OSD-0
     // order prefix; a bp handle pays nothing for it.
     // wide_ok = false is setup's own retry without the wide-grid term (bp_gpu.cu).
+    // relay: the handle decodes with Relay-BP; setup allocates the leg arrays here, so
+    // the decode path allocates nothing.
     bool setup(uint32_t m_, uint32_t n_, const uint32_t *colptr, const uint32_t *rowind, bool osd0,
-               bool wide_ok = true);
+               bool wide_ok = true, bool relay = false);
     // Upload the prior LLRs (n entries), on the handle's own stream and completed before returning.
     // Called from create and from dbench_set_priors only.  Returns false when any step failed; the
     // device may then hold part of the new priors, so the caller re-runs it with the previous priors
@@ -170,6 +189,18 @@ public:
     // when need_post).  Throws std::runtime_error on a CUDA failure: the caller turns that into an
     // error return and never into DBENCH_OK.
     uint32_t run(const uint8_t *syn01, uint32_t max_iter, double alpha, bool need_post);
+    // One Relay-BP decode (see RelaySpec).  Runs the legs back to back, each one the
+    // ordinary min-sum kernel of this handle plus the memory bias; between legs the final marginals
+    // stay on the device (a device-to-device copy) and become the next leg's input.  Returns the
+    // number of converged solutions found; decoding[] then points at the lowest-weight one (or, when
+    // none converged, at the last leg's hard decision) and last_converged says which.  Throws
+    // std::runtime_error on a CUDA failure.  posteriors are not fetched here: fetch_posterior().
+    uint32_t run_relay(const uint8_t *syn01, const RelaySpec &spec);
+    // Total message-passing iterations of the most recent run_relay() (all legs together).
+    uint32_t relay_iterations() const { return relay_iters_; }
+    // Solutions found / leg count of the most recent run_relay() (probe and test use).
+    uint32_t relay_found() const { return relay_found_; }
+    uint32_t relay_legs_run() const { return relay_legs_; }
     // Copy the last shot's posteriors into posterior[] (device -> host) if they are not there yet.
     // Returns false on a CUDA failure; true when posterior[] is valid.
     bool fetch_posterior();
@@ -195,6 +226,24 @@ private:
     // decision were written to; fetch_posterior() copies from that buffer.  Set by run() from the
     // shot's own status word; 0 for a kernel without the double buffer.
     uint32_t last_post_parity = 0;
+
+    // Relay-BP: one leg of run_relay() -- upload the leg's gamma pair, launch the ordinary
+    // kernel with the memory bias, hand back [dec | status] and leave the leg's final marginals in
+    // the handle's d_marg.  Returns the iteration count the status word reports.
+    uint32_t relay_leg(const uint8_t *syn01, uint32_t max_it, uint32_t leg, const RelaySpec &spec);
+    // The launch itself, with the gamma arrays already uploaded: one leg whose input marginals are
+    // mem_marg.  relay_leg() sets the leg's gamma pair and calls this; the test build's dump calls
+    // it directly with a fixed pair.
+    uint32_t relay_leg_launch(const uint8_t *syn01, uint32_t max_it, const double *mem_marg,
+                              double alpha);
+    bool relay_ran_ = false;        // the most recent decode was run_relay (fetch_posterior reads d_marg)
+    uint32_t relay_found_ = 0;      // converged solutions of the most recent run_relay
+    uint32_t relay_iters_ = 0;      // iterations of all its legs together
+    uint32_t relay_legs_ = 0;       // legs it ran
+    // Allocated at setup (relay handles only): the host prior LLRs (the paper's solution weight),
+    // and the lowest-weight correction found so far.  No allocation on the decode path.
+    std::vector<double> prior_host_;
+    std::vector<uint8_t> relay_best_;
 };
 
 }  // namespace fastbp

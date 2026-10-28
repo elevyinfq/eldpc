@@ -306,6 +306,22 @@ struct Dev {
     uint32_t m, n, max_iter, wpr;
     uint32_t use_synparam;  // 1: read the syndrome out of syn_bits, 0: out of syn
     double alpha;
+    // Relay-BP: memory-BP leg state.  mem_on is 0 on every ordinary BP shot, and then
+    // none of the three arrays is read: the column passes take their initial value from the prior
+    // alone, exactly as before.  On a relay shot the column passes start their chain at the memory
+    // bias Lambda_j(t) = (1 - gamma_j) * lambda_j + gamma_j * M_j(t-1) (paper Eq. 4): mem_gamma is
+    // gamma_j, mem_omg is 1 - gamma_j, and mem_marg is the leg's input marginals M(0) (all three in
+    // the caller's column order, n doubles).  For t > 1 M(t-1) is the previous iteration's posterior,
+    // read from the parity buffer this pass does not write.
+    const double *mem_marg;
+    const double *mem_gamma;
+    const double *mem_omg;
+    // The iteration's memory bias, one double per column in the layout's read order (position order
+    // for the interleaved layout, column order otherwise).  It is refilled by relay_bias_pass at the
+    // top of every memory-BP iteration; the column pass then reads it exactly where it used to read
+    // the prior, so its arithmetic and its register budget do not change with the mode.
+    double *mem_bias;
+    unsigned mem_on;           // 1: this launch is one memory-BP relay leg
     unsigned long long syn_bits[kSynWords];  // the shot's syndrome, bit-packed (row r -> bit r)
     // The handle's mapped status block (see StatusCtl, in mapped pinned host memory).  The
     // kernel publishes the shot's status and generation here at the end of its body; the host polls
@@ -1253,6 +1269,40 @@ __global__ void osd_repick_kernel(Dev d) {
 // stream's launch path from going idle (at a 10 ms call cycle the clocks sag inside P1).
 __global__ void keep_warm_kernel() {}
 
+// Relay-BP: the memory strengths of one leg.  Leg 0 uses the paper's uniform gamma0; every
+// later leg draws gamma_j independently and uniformly from [gamma_lo, gamma_hi] (the paper's "Memory
+// strength selection"; the gross-code interval is [-0.24, 0.66]).  The draw is a SplitMix64 hash of
+// (seed, leg, column): deterministic, reproducible on the host (tools/relay/t_relay_model.py has the same
+// function), and independent of the handle's history, so a handle's outputs depend only on the
+// problem, the config, the priors and the syndrome.  The arithmetic here is round-to-nearest on the
+// device (__dadd_rn / __dmul_rn) whatever the caller's mode: the leg's gamma vector is an input of
+// the exactness unit test, not an output of it, and one fixed rule keeps it reproducible.
+__device__ __forceinline__ unsigned long long relay_mix64(unsigned long long z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+__device__ __forceinline__ unsigned long long relay_draw_bits(unsigned long long seed, uint32_t leg,
+                                                              uint32_t j) {
+    unsigned long long z = seed ^ (0x9E3779B97F4A7C15ull * (unsigned long long)(leg + 1u));
+    return relay_mix64(z + 0xD1B54A32D192ED03ull * (unsigned long long)(j + 1u));
+}
+__global__ void relay_gamma_kernel(double *gamma, double *omg, uint32_t n, uint32_t leg,
+                                   double g0, double lo, double hi, unsigned long long seed) {
+    const uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    double g;
+    if (leg == 0u) {
+        g = g0;
+    } else {
+        const unsigned long long z = relay_draw_bits(seed, leg, j);
+        const double u = (double)(z >> 11) * 0x1.0p-53;   // [0, 1), exactly representable
+        g = __dadd_rn(lo, __dmul_rn(hi - lo, u));
+    }
+    gamma[j] = g;
+    omg[j] = __dadd_rn(1.0, -g);
+}
+
 // Host-side launch of the repick kernel in the handle's rounding mode (one instantiation per mode,
 // as the BP kernels have; the launch is the same cooperative-free plain launch it was).
 // The launch's own error is returned and checked (CK) by both callers.  An earlier form
@@ -1635,11 +1685,12 @@ __global__ void prior_pos_kernel(const double *prior, const uint32_t *cperm, dou
 template <int RM, bool FIRST>
 __device__ __forceinline__ void col_sum_pass_ilv(const Dev &d) {
     const uint32_t c0 = col_begin(d), c1 = col_end(d);
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior_pos;   // Relay-BP: prior or memory bias
     for (uint32_t p = c0 + threadIdx.x; p < c1; p += blockDim.x) {
         const uint32_t s0 = ilv_slot0(p);
         const uint32_t deg = d.cdeg[p];
         const uint32_t col = d.cperm[p];
-        double t = d.prior_pos[p];   // the prior in position order (same bits)
+        double t = tinit[p];   // the prior, or the iteration's memory bias (Relay-BP)
         double cb[kRegDeg];
         double pre[kRegDeg];
         uint32_t s = s0;
@@ -1674,10 +1725,11 @@ __device__ __forceinline__ void col_sum_pass(const Dev &d) {
     const uint32_t per_block = (d.n + gridDim.x - 1u) / gridDim.x;
     const uint32_t c0 = blockIdx.x * per_block;
     const uint32_t c1 = (c0 + per_block < d.n) ? (c0 + per_block) : d.n;
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior;   // Relay-BP: prior or memory bias
     for (uint32_t col = c0 + threadIdx.x; col < c1; col += blockDim.x) {
         const uint32_t b = d.cptr[col], e = d.cptr[col + 1];
         const uint32_t deg = e - b;
-        double t = d.prior[col];
+        double t = tinit[col];   // the prior, or the iteration's memory bias (Relay-BP)
         if (deg <= kRegDeg) {
             double cb[kRegDeg];
             double pre[kRegDeg];
@@ -1741,11 +1793,12 @@ constexpr bool kDualReg = true;
 template <int RM>
 __device__ __forceinline__ void col_pass_ilv(const Dev &d) {
     const uint32_t c0 = col_begin(d), c1 = col_end(d);
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior_pos;   // Relay-BP: prior or memory bias
     for (uint32_t p = c0 + threadIdx.x; p < c1; p += blockDim.x) {
         const uint32_t s0 = ilv_slot0(p);
         const uint32_t deg = d.cdeg[p];
         const uint32_t col = d.cperm[p];
-        double t = d.prior_pos[p];   // the prior in position order (same bits)
+        double t = tinit[p];   // the prior, or the iteration's memory bias (Relay-BP)
         double msg[kRegDeg];
         double pre[kRegDeg];
         uint32_t s = s0;
@@ -1776,10 +1829,11 @@ __device__ __forceinline__ void col_pass(const Dev &d) {
     const uint32_t per_block = (d.n + gridDim.x - 1u) / gridDim.x;
     const uint32_t c0 = blockIdx.x * per_block;
     const uint32_t c1 = (c0 + per_block < d.n) ? (c0 + per_block) : d.n;
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior;   // Relay-BP: prior or memory bias
     for (uint32_t col = c0 + threadIdx.x; col < c1; col += blockDim.x) {
         const uint32_t b = d.cptr[col], e = d.cptr[col + 1];
         const uint32_t deg = e - b;
-        double t = d.prior[col];
+        double t = tinit[col];   // the prior, or the iteration's memory bias (Relay-BP)
         if (deg <= kRegDeg) {
             double msg[kRegDeg];
             double pre[kRegDeg];
@@ -1914,15 +1968,17 @@ template <int RM, bool FIRST>
 __device__ __forceinline__ void col_fused_pass(const Dev &d, const FusedSh &f,
                                                const uint32_t *rlist, uint32_t ns, uint32_t base,
                                                uint32_t pbuf, bool last, const uint32_t *rows_sh,
-                                               uint32_t am_off, double *post, uint8_t *dec) {
+                                               uint32_t am_off, double *post, uint8_t *dec,
+                                               const double *mprev_post) {
     (void)rlist; (void)ns; (void)base; (void)pbuf;
     const uint32_t per_block = (d.n + gridDim.x - 1u) / gridDim.x;
     const uint32_t c0 = blockIdx.x * per_block;
     const uint32_t c1 = (c0 + per_block < d.n) ? (c0 + per_block) : d.n;
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior;
     for (uint32_t col = c0 + threadIdx.x; col < c1; col += blockDim.x) {
         const uint32_t b = d.cptr[col], e = d.cptr[col + 1];
         const uint32_t deg = e - b;
-        double t = d.prior[col];
+        double t = tinit[col];   // the prior, or the iteration's memory bias (Relay-BP)
         if (deg <= kRegDeg) {
             double cb[kRegDeg], pre[kRegDeg];
             uint32_t rowid[kRegDeg];
@@ -2058,6 +2114,7 @@ __device__ __forceinline__ void col_fused_pass_ilv(const Dev &d, const FusedSh &
                                                    const uint32_t *rlist, uint32_t ns, uint32_t base,
                                                    uint32_t pbuf, bool last, const uint32_t *rows_sh,
                                                    uint32_t am_off, double *post, uint8_t *dec,
+                                                   const double *mprev_post,
                                                    const uint8_t *rslot_sh = nullptr,
                                                    uint32_t lbase = 0, uint32_t rslot_n = 0,
                                                    double *win = nullptr) {
@@ -2078,6 +2135,10 @@ __device__ __forceinline__ void col_fused_pass_ilv(const Dev &d, const FusedSh &
     if constexpr (RSLOT) {
         if (d.win_rounds != 0u) mb = win - (size_t)lbase;
     }
+    // Relay-BP: where this pass's chain starts -- the prior (an ordinary shot) or the iteration's
+    // memory bias, in the same position order (relay_bias_pass_ilv fills it).  One pointer chosen
+    // once for the pass: the loop below is the same code either way.
+    const double *const tinit = (d.mem_on != 0u) ? d.mem_bias : d.prior_pos;
     // The block's per-position row-slot bytes.  For the block's position
     // lp (= p - c0) the row slot of round i is byte i of the packed triple: bytes 0..3 in word lp of
     // w0, 4..7 in word lp of w1, and the ninth byte in b8[lp].  Three independent word loads give a
@@ -2095,7 +2156,10 @@ __device__ __forceinline__ void col_fused_pass_ilv(const Dev &d, const FusedSh &
         const uint32_t jsw0 = RSLOT ? rslot_w0[lp] : 0u;
         const uint32_t jsw1 = RSLOT ? rslot_w1[lp] : 0u;
         const uint32_t jsb8 = RSLOT ? (uint32_t)rslot_b8[lp] : 0u;
-        double t = d.prior_pos[p];   // the prior in position order (same bits)
+        // Relay-BP (memory BP): tinit is the prior on an ordinary shot and the memory bias
+        // relay_bias_pass built for this iteration on a relay leg (paper Eq. 4).  The edge value v
+        // below stays the prior: the paper's nu_j->i(0) = lambda_j at a leg's first iteration.
+        double t = tinit[p];
         double cb[kRegDeg], pre[kRegDeg];
         uint32_t rowid[kRegDeg];
         uint32_t s = s0;
@@ -2288,6 +2352,36 @@ __device__ __forceinline__ void fused_merge(const Dev &d, FusedSh &f, uint32_t n
     __syncthreads();
 }
 
+// Relay-BP: the memory bias of one iteration, the paper's Eq. (4)
+//     Lambda_j(t) = (1 - gamma_j) * lambda_j + gamma_j * M_j(t-1),
+// in this kernel's addition order and the caller's rounding mode, written where the column pass
+// reads it: position order for the interleaved layout (what the pass reads), column order otherwise.
+// M(t-1) is the previous iteration's posterior in the buffer the pass does not write (or, at a leg's
+// first iteration, the leg's input marginals).  Two per-thread scalar loads and two FP64 operations
+// per column: no arrays, so the function has no register pressure of its own, and the column pass it
+// feeds keeps its ordinary code (it reads the prior on an ordinary shot, this table on a relay shot).
+template <int RM, bool FIRST>
+__device__ __forceinline__ void relay_bias_pass_ilv(const Dev &d, const double *mprev) {
+    const uint32_t c0 = col_begin(d), c1 = col_end(d);
+    for (uint32_t p = c0 + threadIdx.x; p < c1; p += blockDim.x) {
+        const uint32_t col = d.cperm[p];
+        const double m = FIRST ? d.mem_marg[col] : mprev[col];
+        d.mem_bias[p] = dadd<RM>(dmul<RM>(d.mem_omg[col], d.prior_pos[p]),
+                                  dmul<RM>(d.mem_gamma[col], m));
+    }
+}
+template <int RM, bool FIRST>
+__device__ __forceinline__ void relay_bias_pass(const Dev &d, const double *mprev) {
+    const uint32_t per_block = (d.n + gridDim.x - 1u) / gridDim.x;
+    const uint32_t c0 = blockIdx.x * per_block;
+    const uint32_t c1 = (c0 + per_block < d.n) ? (c0 + per_block) : d.n;
+    for (uint32_t col = c0 + threadIdx.x; col < c1; col += blockDim.x) {
+        const double m = FIRST ? d.mem_marg[col] : mprev[col];
+        d.mem_bias[col] = dadd<RM>(dmul<RM>(d.mem_omg[col], d.prior[col]),
+                                   dmul<RM>(d.mem_gamma[col], m));
+    }
+}
+
 // The fused body.  The convergence test of iteration it judges the state the column pass of it-2
 // left, and the tail judges the states max_iter-1 and max_iter; every state 1..max_iter the shipped
 // body can stop at is judged, at the earliest point bp.hpp would stop, so the status word, the
@@ -2456,6 +2550,9 @@ __device__ uint32_t bp_body_fused(const Dev &d) {
         // This iteration's post / dec buffer -- iteration it writes buffer it & 1.
         double *const post = (it & 1u) ? d.post2 : d.post;
         uint8_t *const dec = (it & 1u) ? d.dec2 : d.dec;
+        // Relay-BP: the previous iteration's posterior, for the memory bias (the buffer the
+        // parity double buffer leaves untouched by this iteration).  Unused when d.mem_on == 0.
+        const double *const mprev_post = (it & 1u) ? d.post : d.post2;
         if (threadIdx.x == 0) {
             tot_sh = (it >= 3u) ? __ldcg((const unsigned *)&d.mis[(it - 2u) % 3u]) : 1u;
             test_delay_prologue(10u);   // test-only: the per-iteration mismatch-counter reset
@@ -2476,6 +2573,19 @@ __device__ uint32_t bp_body_fused(const Dev &d) {
         // so the last iteration -- whose column pass and merge do only the mismatch -- is selected at run
         // time, with a grid-uniform branch, inside the instantiations the base already carries.
         const bool last = (it == d.max_iter);
+        // Relay-BP: build this iteration's memory bias before the column pass reads it.
+        // A block barrier orders the table within the block (the pass reads the same block's range);
+        // on an ordinary shot (mem_on == 0) nothing runs and no barrier is added.  The non-interleaved
+        // fused kernel does not carry the pass: its 128-register budget spills with it (STACK 16 ->
+        // 32 B, measured), so setup never gives a relay handle that schedule (try_fused's gate) and
+        // relay_leg refuses the combination outright -- this is unreachable, not a silent fallback.
+        if (d.mem_on != 0u) {
+            if constexpr (ILV) {
+                if (it == 1u) relay_bias_pass_ilv<RM, true>(d, mprev_post);
+                else          relay_bias_pass_ilv<RM, false>(d, mprev_post);
+                __syncthreads();
+            }
+        }
         if (it == 1u) {
             // No prologue pass and no prologue grid barrier.
             // SHSUM staged iteration 1's summaries in the block's own shared tables before the loop;
@@ -2485,14 +2595,16 @@ __device__ uint32_t bp_body_fused(const Dev &d) {
             // is why the push's buffers are not initialised in the prologue but left clean by the
             // previous shot -- the rotation.
             if constexpr (ILV) col_fused_pass_ilv<RM, true, SHSUM, RSLOT>(d, f, rlist, ns, base, pbuf, last,
-                                                                          meta_sh, am_off, post, dec,
+                                                                          meta_sh, am_off, post, dec, mprev_post,
                                                                           rslot_sh, lbase, rslot_n, win);
-            else               col_fused_pass<RM, true>(d, f, rlist, ns, base, pbuf, last, meta_sh, am_off, post, dec);
+            else               col_fused_pass<RM, true>(d, f, rlist, ns, base, pbuf, last, meta_sh, am_off, post, dec,
+                                                        mprev_post);
         } else {
             if constexpr (ILV) col_fused_pass_ilv<RM, false, SHSUM, RSLOT>(d, f, rlist, ns, base, pbuf, last,
-                                                                           meta_sh, am_off, post, dec,
+                                                                           meta_sh, am_off, post, dec, mprev_post,
                                                                            rslot_sh, lbase, rslot_n, win);
-            else               col_fused_pass<RM, false>(d, f, rlist, ns, base, pbuf, last, meta_sh, am_off, post, dec);
+            else               col_fused_pass<RM, false>(d, f, rlist, ns, base, pbuf, last, meta_sh, am_off, post, dec,
+                                                         mprev_post);
         }
         grid_barrier(d);                                        // the single barrier of the iteration
         if (threadIdx.x < blockDim.x / 32) row_mis[threadIdx.x] = 0;
@@ -2635,6 +2747,19 @@ __device__ uint32_t bp_body(const Dev &d) {
                 d.status[1] = 1u;
             }
             return 0u;   // converged: no prefix pass ran, no rung-two tail
+        }
+        // Relay-BP: this iteration's memory bias, in this layout's read order.  The
+        // block barrier orders it; on an ordinary shot nothing runs and no barrier is added.
+        if (d.mem_on != 0u) {
+            const double *mprev = d.post;   // the single post buffer still holds M(t-1)
+            if constexpr (ILV) {
+                if (it == 1) relay_bias_pass_ilv<RM, true>(d, mprev);
+                else         relay_bias_pass_ilv<RM, false>(d, mprev);
+            } else {
+                if (it == 1) relay_bias_pass<RM, true>(d, mprev);
+                else         relay_bias_pass<RM, false>(d, mprev);
+            }
+            __syncthreads();
         }
         if constexpr (SUM) {
             if (it == 1) col_sum_pass<RM, true, ILV>(d);    // iteration 1's input is the priors
@@ -2914,6 +3039,13 @@ struct GpuState {
     // posterior pointers alias this buffer, so no host-side memcpy of either remains.
     uint8_t *h_res = nullptr;
 
+    // Relay-BP: a relay handle's leg arrays, allocated at create (three n-double arrays):
+    // the leg's input marginals M(0), and this leg's gamma / (1 - gamma) per column.  Null on every
+    // other handle, and then the kernel's memory path is never entered (Dev::mem_on is 0).
+    double *d_marg = nullptr, *d_gamma = nullptr, *d_omg = nullptr;
+    double *d_mem_bias = nullptr;   // n: the iteration's memory-bias table (relay_bias_pass)
+    int relay = 0;
+
     cudaStream_t stream = nullptr;
     cudaEvent_t ev = nullptr;
 
@@ -2948,6 +3080,7 @@ struct GpuState {
         fre(d_psign); fre(d_am1); fre(d_am2); fre(d_asign);
         fre(d_out2); fre(d_prior); fre(d_prior_pos);
         fre(d_b2c); fre(d_c2b); fre(d_out);
+        fre(d_marg); fre(d_gamma); fre(d_omg); fre(d_mem_bias);   // Relay-BP leg arrays
         fre(d_syn); fre(d_mis);
         fre(d_okey); fre(d_osamp); fre(d_ohist); fre(d_otau);
         fre(d_hand); fre(d_ocand);   // d_ocnt and d_ocand_sort point into d_hand
@@ -3213,7 +3346,7 @@ static void balance_block_groups(const std::vector<uint32_t> &idx,
 }
 
 bool Engine::setup(uint32_t m_, uint32_t n_, const uint32_t *colptr, const uint32_t *rowind,
-                   bool osd0, bool wide_ok) {
+                   bool osd0, bool wide_ok, bool relay) {
     int ndev = 0;
     cudaError_t e = cudaGetDeviceCount(&ndev);
     if (e != cudaSuccess) {
@@ -3326,6 +3459,23 @@ bool Engine::setup(uint32_t m_, uint32_t n_, const uint32_t *colptr, const uint3
         g->d_spar = (int *)dev_alloc((size_t)(m_ ? m_ : 1) * 4);
         g->d_spar0 = (int *)dev_alloc((size_t)(m_ ? m_ : 1) * 4);
         g->d_prior = (double *)dev_alloc((size_t)n_ * 8);
+        // Relay-BP: a relay handle's three leg arrays -- the leg's input marginals M(0),
+        // and this leg's gamma and 1 - gamma per column.  Allocated (and zeroed) here, at create;
+        // the decode path only writes them through kernels and one device-to-device copy.
+        if (relay) {
+            g->relay = 1;
+            g->d_marg = (double *)dev_alloc((size_t)n_ * 8);
+            g->d_gamma = (double *)dev_alloc((size_t)n_ * 8);
+            g->d_omg = (double *)dev_alloc((size_t)n_ * 8);
+            g->d_mem_bias = (double *)dev_alloc((size_t)n_ * 8);
+            CK(cudaMemsetAsync(g->d_marg, 0, (size_t)n_ * 8, g->stream));
+            CK(cudaMemsetAsync(g->d_gamma, 0, (size_t)n_ * 8, g->stream));
+            CK(cudaMemsetAsync(g->d_omg, 0, (size_t)n_ * 8, g->stream));
+            // The host side of a relay decode: the prior LLRs (the paper's solution weight) and the
+            // lowest-weight correction found so far.  Both are created here, never in dbench_decode.
+            prior_host_.assign((size_t)n_, 0.0);
+            relay_best_.assign((size_t)n_, 0);
+        }
         // [dec (n) | status (8) | post (8n)] in one device region and one pinned region of
         // the same shape.  The status word sits on an 8-byte boundary so the prefix copy of a
         // BP-converged shot carries dec and status in one cudaMemcpyAsync, and the posterior is
@@ -3929,6 +4079,13 @@ bool Engine::setup(uint32_t m_, uint32_t n_, const uint32_t *colptr, const uint3
             // row-slot-staged variant first and falls back to the base's fused kernel (never to the
             // two-barrier path for a problem the base ran fused).
             auto try_fused = [&](bool rslot, size_t shb) -> bool {
+                // Relay-BP: the fused non-interleaved pass is the one instantiation whose
+                // STACK frame the memory-bias code would grow (16 -> 32 B; the interleaved and the
+                // RSLOT fused kernels and every other formulation keep their resource use).  A
+                // relay handle therefore takes the fused schedule only in the interleaved layout and
+                // the two-barrier summary (or the in-place kernel) elsewhere -- exact either way,
+                // since every formulation computes the same arithmetic.
+                if (relay && !ilv_) return false;
                 if (!have_optin || shb > (size_t)max_optin || shb > cap) return false;
                 bool ok = true;
                 ok &= set_max_smem(pick_kernel<kRN>(1, ilv_, rslot));
@@ -4022,7 +4179,10 @@ bool Engine::setup(uint32_t m_, uint32_t n_, const uint32_t *colptr, const uint3
         if (wide_only && !(g->sum_mode == 1 && g->win_rounds != 0u)) {
             delete g;
             g = nullptr;
-            return setup(m_, n_, colptr, rowind, osd0, false);
+            // The retry keeps the handle's Relay-BP flag (an earlier form of the mode dropped it
+            // here, so a relay handle whose wide-grid term is dropped at create came back without the
+            // leg arrays and every decode returned EINTERNAL: "relay: no relay handle or no syndrome").
+            return setup(m_, n_, colptr, rowind, osd0, false, relay);
         }
 
         // The mapped control block and the device-side pieces of the persistent kernel.  All of
@@ -4222,6 +4382,12 @@ bool Engine::set_priors(const double *prior_llr_n) {
         // partly on the new priors (d_prior new; the position copy, the first-pass arrays or the OSD
         // window possibly old or new): the caller then re-runs this with its committed priors, which
         // rewrites all of them, and returns an error (dbench_set_priors).
+        // Relay-BP: the paper's solution weight is a sum over the prior LLRs on the host
+        // (fixed order, no atomics); a relay handle keeps this copy, refreshed only here.
+        if (g->relay) {
+            if (prior_host_.size() != (size_t)n) prior_host_.assign((size_t)n, 0.0);
+            std::memcpy(prior_host_.data(), prior_llr_n, (size_t)n * sizeof(double));
+        }
         CK(cudaMemcpyAsync(g->d_prior, prior_llr_n, (size_t)n * 8, cudaMemcpyHostToDevice, g->stream));
         // prior_pos: refill the position-ordered copy on the same stream (ordered
         // after the upload above); create's fill already ran for the zero priors.
@@ -4266,6 +4432,7 @@ bool Engine::set_priors(const double *prior_llr_n) {
 uint32_t Engine::run(const uint8_t *syn01, uint32_t max_iter, double alpha, bool need_post) {
     GpuState *g = gpu_;
     posterior_valid = false;
+    relay_ran_ = false;   // Relay-BP: the ordinary path owns the posterior buffers again
 
     Dev d{};
     d.cptr = g->d_cptr; d.rptr = g->d_rptr; d.redge = g->d_redge;
@@ -4540,6 +4707,191 @@ uint32_t Engine::run(const uint8_t *syn01, uint32_t max_iter, double alpha, bool
 // set at all).  Everything here is this shot's own data -- no reuse of an earlier shot's order,
 // pivots, posterior or flags -- and the walk over the result is the same reference order, so the
 // result is bit-identical to a prefix collected in one rung and to the full-order fallback.
+// Relay-BP: the paper's solution weight w(e) = sum_{j: e_j = 1} lambda_j, as one
+// sequential sum over the columns in increasing order.  A plain host sum, not an atomic reduction:
+// the same solution always gets the same weight bit for bit, so the lowest-weight pick (strict <,
+// earlier leg wins ties) is deterministic across runs, handles, processes and threads.
+static double relay_weight(const std::vector<double> &prior, const uint8_t *dec, uint32_t n) {
+    double w = 0.0;
+    for (uint32_t j = 0; j < n; ++j) {
+        if ((dec[j] & 1u) != 0u) w += prior[j];
+    }
+    return w;
+}
+
+// One Relay-BP leg: the ordinary min-sum kernel of this handle with the memory bias switched on.
+// It launches the same instantiation an ordinary shot launches (the flag is a runtime field, not a
+// template variant), hands back [dec | status] and leaves the leg's final marginals in d_marg --
+// the next leg's input, and the soft output after the last leg.  The status words are the kernel's
+// own: `iterations` is the iteration whose state the reference would return, `converged` says
+// whether that state reproduces the syndrome (the leg's only stopping rule).
+uint32_t Engine::relay_leg(const uint8_t *syn01, uint32_t max_it, uint32_t leg, const RelaySpec &spec) {
+    GpuState *g = gpu_;
+    if (!g || !g->relay || n == 0) throw std::runtime_error("relay: handle is not a relay handle");
+    // This leg's memory strengths (leg 0: uniform gamma0; later legs: the disordered interval).
+    relay_gamma_kernel<<<(g->n + 255u) / 256u, 256, 0, g->stream>>>(
+        g->d_gamma, g->d_omg, g->n, leg, spec.gamma0, spec.gamma_lo, spec.gamma_hi, spec.seed);
+    CK(cudaGetLastError());
+    return relay_leg_launch(syn01, max_it, (leg == 0u) ? g->d_prior : g->d_marg, spec.alpha);
+}
+
+uint32_t Engine::relay_leg_launch(const uint8_t *syn01, uint32_t max_it, const double *mem_marg,
+                                  double alpha) {
+    GpuState *g = gpu_;
+    if (!g || !g->relay || n == 0) throw std::runtime_error("relay: handle is not a relay handle");
+    // The fused non-interleaved kernel has no memory-bias pass (see bp_body_fused); setup never
+    // selects it for a relay handle, and a handle that somehow has it is an error, never a decode
+    // that silently ignores the memory term.
+    if (g->sum_mode == 1 && g->ilv == 0) throw std::runtime_error("relay: fused non-interleaved schedule");
+    Dev d{};
+    d.cptr = g->d_cptr; d.rptr = g->d_rptr; d.redge = g->d_redge;
+    d.rcol = g->d_rcol; d.rind = g->d_rind;
+    d.cperm = g->d_cperm; d.cdeg = g->d_cdeg; d.rslot = g->d_rslot; d.ilv = (uint32_t)g->ilv;
+    d.colbase = g->d_colbase;
+    d.sm1 = g->d_sm1; d.sm2 = g->d_sm2; d.spar = g->d_spar;
+    d.sm1i = g->d_sm1i; d.sm2i = g->d_sm2i; d.spar0 = g->d_spar0;
+    d.sum_mode = (uint32_t)g->sum_mode;
+    d.prior = g->d_prior; d.prior_pos = g->d_prior_pos;
+    d.b2c = g->d_b2c; d.c2b = g->d_c2b; d.post = g->d_post;
+    d.dec = g->d_dec; d.syn = g->d_syn; d.mis = g->d_mis;
+    d.status = g->d_status;
+    d.rowbase = g->d_rowbase; d.rowlist = g->d_rowlist;
+    d.owner_ptr = g->d_owner_ptr; d.owner_slot = g->d_owner_slot;
+    d.meta_off = g->d_meta_off; d.merge_meta = g->d_merge_meta;
+    d.rslot_bytes = g->rslot_bytes;
+    d.rslot_stride = g->rslot_bytes;
+    d.win_off = g->win_off; d.win_rounds = g->rslot ? g->win_rounds : 0u;
+    d.pm1 = g->d_pm1; d.pm2 = g->d_pm2; d.pcnt = g->d_pcnt; d.psign = g->d_psign;
+    d.am1 = g->d_am1; d.am2 = g->d_am2; d.asign = g->d_asign; d.am_stride = g->m;
+    d.post2 = g->d_post2; d.dec2 = g->d_dec2; d.status2 = g->d_status2;
+    d.ns_max = g->ns_max;
+    d.pm_stride = g->pm_stride;
+    d.m = g->m; d.n = g->n; d.max_iter = max_it; d.alpha = alpha; d.wpr = g->wpr;
+    d.use_osd = 0u;      // a relay handle never takes the OSD-0 prefix or the rung-two tail
+    d.tail_on = 0u;
+    d.pub = reinterpret_cast<unsigned long long *>(g->d_status_pub);
+    // Relay-BP: the memory bias.  Leg 0 starts from the priors themselves; every later
+    // leg from the marginals the previous leg's last column pass left in d_marg.
+    d.mem_on = 1u;
+    d.mem_marg = mem_marg;
+    d.mem_gamma = g->d_gamma;
+    d.mem_omg = g->d_omg;
+    d.mem_bias = g->d_mem_bias;
+    const unsigned long long shot_gen = ++g->shot_gen;
+    // The syndrome travels exactly as on an ordinary shot: bit-packed in the launch parameters when
+    // the problem fits the budget, else an H2D copy ordered before the launch.
+    if (g->m <= kSynWords * 64u) {
+        d.use_synparam = 1u;
+        for (uint32_t w = 0; w < kSynWords; ++w) d.syn_bits[w] = 0ull;
+        uint32_t i = 0;
+        uint32_t w = 0;
+        for (; i + 64u <= g->m; i += 64u, ++w) {
+            unsigned long long word = 0ull;
+            for (uint32_t g8 = 0; g8 < 64u; g8 += 8u) {
+                unsigned long long v;
+                std::memcpy(&v, syn01 + i + g8, 8);
+                const unsigned long long packed =
+                    ((v & 0x0101010101010101ull) * 0x0102040810204080ull) >> 56;
+                word |= packed << g8;
+            }
+            d.syn_bits[w] = word;
+        }
+        for (; i + 8u <= g->m; i += 8u) {
+            unsigned long long v;
+            std::memcpy(&v, syn01 + i, 8);
+            const unsigned long long packed =
+                ((v & 0x0101010101010101ull) * 0x0102040810204080ull) >> 56;
+            d.syn_bits[i >> 6] |= packed << (i & 63u);
+        }
+        for (; i < g->m; ++i) {
+            d.syn_bits[i >> 6] |= (unsigned long long)(syn01[i] & 1u) << (i & 63u);
+        }
+    } else {
+        d.use_synparam = 0u;
+        for (uint32_t i = 0; i < g->m; ++i) g->h_syn[i] = (uint8_t)(syn01[i] & 1u);
+        CK(cudaMemcpyAsync(g->d_syn, g->h_syn, g->m, cudaMemcpyHostToDevice, g->stream));
+    }
+    unsigned long long gen_arg = shot_gen;
+    void *args[] = {&d, &gen_arg};
+    dim3 grid(g->nblocks), block((unsigned)g->nthreads);
+    const bool ilv = (g->ilv != 0);
+    const int sm_ = g->sum_mode;
+    const bool rslot = (sm_ == 1) && (g->rslot != 0);
+    const size_t shb = (sm_ == 1) ? g->fused_shbytes : 0u;
+    const void *fn = (g->rm == kRU) ? pick_kernel<kRU>(sm_, ilv, rslot)
+                   : (g->rm == kRD) ? pick_kernel<kRD>(sm_, ilv, rslot)
+                   : (g->rm == kRZ) ? pick_kernel<kRZ>(sm_, ilv, rslot)
+                                    : pick_kernel<kRN>(sm_, ilv, rslot);
+    CK(cudaLaunchCooperativeKernel(fn, grid, block, args, shb, g->stream));
+    // The leg's [dec | status] hand-off, the same region and offsets an ordinary shot uses.  A leg is
+    // ms-scale work whose verdict decides whether another leg runs, so the host waits for it here.
+    // The fused body's parity double buffer: the correction is in buffer (iteration & 1), and the
+    // convergence verdict is known only after the status arrives -- so copy the buffer max_iter's
+    // last pass wrote (the non-converged case, the common one), and re-copy from the other buffer
+    // when the status names the other parity (a shot that converged early).  Both buffers carry the
+    // status word (status2 is the epilogue's copy), so the first copy always yields the verdict.
+    const bool fused_parity = (g->sum_mode == 1);
+    const uint32_t predicted_parity = fused_parity ? (max_it & 1u) : 0u;
+    const uint8_t *src_out = (predicted_parity != 0u) ? g->d_out2 : g->d_out;
+    CK(cudaMemcpyAsync(g->h_res, src_out, g->pre_bytes, cudaMemcpyDeviceToHost, g->stream));
+    CK(cudaStreamSynchronize(g->stream));
+    const uint32_t *st = reinterpret_cast<const uint32_t *>(g->h_res + g->status_off);
+    const uint32_t it = st[0];
+    last_converged = (st[1] != 0u);
+    last_post_parity = fused_parity ? (it & 1u) : 0u;
+    if (fused_parity && last_post_parity != predicted_parity) {
+        // A converged leg whose state sits in the other parity buffer: the correction (and the
+        // status word, identical in both buffers) has to come from there.
+        src_out = last_post_parity ? g->d_out2 : g->d_out;
+        CK(cudaMemcpyAsync(g->h_res, src_out, g->pre_bytes, cudaMemcpyDeviceToHost, g->stream));
+        CK(cudaStreamSynchronize(g->stream));
+    }
+    // The leg's final marginals become M(0) of the next leg and the handle's soft output.  The copy
+    // is on the handle's stream, so the next leg's launch (and any later posterior copy) is ordered
+    // behind it; the fusing kernel's final state is in the parity buffer its status iteration names.
+    const double *src = (g->sum_mode == 1 && last_post_parity != 0u) ? g->d_post2 : g->d_post;
+    CK(cudaMemcpyAsync(g->d_marg, src, (size_t)g->n * 8, cudaMemcpyDeviceToDevice, g->stream));
+    return it;
+}
+
+uint32_t Engine::run_relay(const uint8_t *syn01, const RelaySpec &spec) {
+    GpuState *g = gpu_;
+    posterior_valid = false;
+    relay_ran_ = true;
+    relay_found_ = 0;
+    relay_iters_ = 0;
+    relay_legs_ = 0;
+    if (!g || !g->relay || n == 0 || syn01 == nullptr) {
+        throw std::runtime_error("relay: no relay handle or no syndrome");
+    }
+    double best_w = 0.0;
+    bool have_best = false;
+    const uint32_t max_legs = spec.max_legs < 1u ? 1u : spec.max_legs;
+    for (uint32_t leg = 0; leg < max_legs; ++leg) {
+        const uint32_t max_it = (leg == 0u) ? spec.pre_iter : spec.set_iter;
+        const uint32_t it = relay_leg(syn01, max_it, leg, spec);
+        relay_iters_ += it;
+        relay_legs_ = leg + 1u;
+        if (last_converged) {
+            // The correction of a converged leg is h_res[0..n) (the leg's hand-off); weigh it with
+            // the paper's w(e) and keep the strictly lighter one (ties: the earlier leg wins).
+            const double w = relay_weight(prior_host_, g->h_res, g->n);
+            ++relay_found_;
+            if (!have_best || w < best_w) {
+                best_w = w;
+                have_best = true;
+                std::memcpy(relay_best_.data(), g->h_res, (size_t)g->n);
+            }
+            if (relay_found_ >= (spec.stop_nconv < 1u ? 1u : spec.stop_nconv)) break;
+        }
+    }
+    // The decode's correction: the lowest-weight converged solution, or -- when no leg converged --
+    // the last leg's hard decision (the plain BP rule for a failed shot), which is what h_res holds.
+    if (have_best) std::memcpy(g->h_res, relay_best_.data(), (size_t)g->n);
+    decoding = g->h_res + 0u;
+    return relay_found_;
+}
+
 bool Engine::keep_warm_gpu() {
     GpuState *g = gpu_;
     if (g == nullptr) return false;
@@ -4678,7 +5030,10 @@ bool Engine::fetch_posterior() {
         cudaStream_t ds = g->stream;
         // The posterior lives in the parity buffer the last shot's final state was written
         // to (run() records it); a kernel without the double buffer always wrote buffer 0.
-        const double *src = (g->sum_mode == 1 && last_post_parity) ? g->d_post2 : g->d_post;
+        // Relay-BP: after run_relay the final leg's marginals are already in d_marg (every
+        // leg copies its final state there), which is what the next leg read as M(0).
+        const double *src = relay_ran_ ? g->d_marg
+                          : ((g->sum_mode == 1 && last_post_parity) ? g->d_post2 : g->d_post);
         CK(cudaMemcpyAsync(g->h_res + g->post_off, src, (size_t)g->n * 8,
                            cudaMemcpyDeviceToHost, ds));
         CK(cudaStreamSynchronize(ds));
