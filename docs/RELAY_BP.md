@@ -43,7 +43,7 @@ config = dict(decoder="bp", bp_method="ms", max_iter=1,
               relay=1, relay_legs=5, relay_pre_iter=80, relay_set_iter=60,
               relay_gamma0=0.1, relay_gamma_lo=-0.24, relay_gamma_hi=0.66,
               relay_seed=7, ms_scaling_factor=1.0)
-with eldpc.Decoder(h, o, priors, config, device="gpu") as decoder:
+with eldpc.Decoder(h, o, priors, config=config, device="gpu") as decoder:
     correction, observables, status = decoder.decode_full(syndrome)
     if status & eldpc.ST_SYNDROME_UNMATCHED:
         raise RuntimeError("No Relay-BP leg converged within the budget")
