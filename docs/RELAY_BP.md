@@ -56,12 +56,6 @@ returns a zero correction immediately. The status iteration count sums iteration
 and saturates at 65535; soft output is the **last leg's** marginals, even when an earlier leg's
 correction wins. Library batch decoding is a sequential loop over shots.
 
-Mode-on verification covers round-to-nearest. Directed rounding is not covered by the original
-exactness contract for this mode: gamma generation uses round-to-nearest even when other
-operations follow the caller's rounding mode. Infinite LLRs (for example endpoint priors) can
-produce non-finite memory biases; use finite LLRs for this operating point. Each leg has a host
-synchronization, so a leg cap is a work budget, not a latency guarantee.
-
 The algorithm follows T. Müller et al., [arXiv:2506.01779](https://arxiv.org/abs/2506.01779).
 The implementation's gamma stream differs from IBM's `relay_bp`; per-shot parity with that
 package is not promised. Its `num_sets` counts subsequent legs, whereas `relay_legs` includes
@@ -73,3 +67,25 @@ ABI; they are not standalone package entry points. `t_relay_config.py`,
 the last requires a separate, non-installed `FASTBP_TEST_RELAY_DUMP=1` build. The repository's
 `tests/test_bit_identity.py` and `verify/run_verify.py --quick` check the original mode against
 an independent reference (and against a base build with `ELDPC_REFERENCE_LIB` set).
+
+## Limitations
+
+All GPU verification and tests for this revision ran on sm_120 (RTX 5080). No runtime tests
+ran on sm_89 (RTX 6000 Ada). Relay-on verification includes the AVX-512 host build with the
+default GPU core; Relay-on has not been tested with the `ada64` core. The full suite exercised
+`ada64` with Relay off on the RTX 5080.
+
+A static CUDA 13.3.73 resource comparison against base `79ee5e5` shows 12 fused BP kernels on
+sm_89 growing by 40–104 stack bytes and 7–47 STL/LDL instruction sites. Non-fused kernels also
+grow: for example, `bp_kernel<0,0,false,256,…>` grows from 904 to 976 stack bytes and from
+235 to 259 STL/LDL sites. This includes kernels used with Relay off. On sm_120, no matched
+kernel grows in stack or STL/LDL sites. These are static resource counts; the runtime impact
+on Ada, with Relay on or off, is unmeasured. Reproduce with
+`python tools/relay/res_diff.py <base-core.so> <relay-core.so> --all`, setting `CUOBJDUMP`
+to a wrapper that invokes `cuobjdump -arch sm_89` (or `-arch sm_120`).
+
+Mode-on verification covers round-to-nearest. Directed rounding is not covered by the original
+exactness contract for this mode: gamma generation uses round-to-nearest even when other
+operations follow the caller's rounding mode. Infinite LLRs (for example endpoint priors) can
+produce non-finite memory biases; use finite LLRs for this operating point. Each leg has a host
+synchronization, so a leg cap is a work budget, not a latency guarantee.

@@ -13,6 +13,7 @@ Relay-BP is also available as an optional GPU-only mode (`decoder=bp`, `relay > 
 default. With it off, the original exactness contract holds, checked against the base build and
 with the patch verification tools. With it on, it is a new operating point. See
 [Relay-BP usage and config keys](docs/RELAY_BP.md).
+See also the [hardware and numerical limitations](docs/RELAY_BP.md#limitations).
 
 ## What eldpc is and is not
 
