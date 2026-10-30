@@ -5,9 +5,9 @@ OSD-0 on the host, outputs bit-identical to the reference BP+OSD-0): Python pack
 
 ## Where things are
 
-- `src/core/`: the frozen decoder core, identical to the benched sources except that development-history
-  comments were neutralised (code tokens and line structure: `TOKENS.sha256`, `tools/check_comment_only.py`;
-  raw bytes: `SOURCES.sha256`). Never edit.
+- `src/core/`: frozen at the Relay-BP revision of base `79ee5e5` (`TOKENS.sha256` and
+  `SOURCES.sha256`). Relay-BP changed `bp_engine.hpp`, `bp_gpu.cu` and `fastbpgpu6g.cpp`; the
+  other three retain the original comment-only provenance. Never edit.
 - `src/cpu/`: the optional CPU core (fastbpcpu6g), four frozen sources, with the same comment-only
   difference from the sources they came from (`test_cpu_sources.py`, `TOKENS.sha256`, `SOURCES.sha256`).
   Never edit them either.
@@ -30,7 +30,10 @@ OSD-0 on the host, outputs bit-identical to the reference BP+OSD-0): Python pack
 
 - Exactness: no change may alter any output (correction, observables, status word, soft output) of
   any shot at the same problem and config. A faster change with different outputs is a bug. The
-  CPU core must return exactly what the GPU core and the reference return.
+  CPU core must return exactly what the GPU core and the reference return with Relay-BP off.
+  Relay-BP is off by default; mode off retains the original exactness contract, verified against
+  the base and with the patch tools. Mode on is a new operating point, GPU only, `decoder=bp`;
+  see `docs/RELAY_BP.md` for every `relay*` key and round-to-nearest limitations.
 - Never edit `src/core/` (`cd src/core && sha256sum -c SOURCES.sha256` must pass) or `src/cpu/`
   (`cd src/cpu && sha256sum -c --strict SOURCES.sha256` must pass; so must
   `python3 tools/check_comment_only.py --check`). No fast math, no FMA

@@ -4,6 +4,20 @@ Copyright 2026 The eldpc Authors
 This product is licensed under the Apache License, Version 2.0 (LICENSE). It contains third-party
 code, listed with its licences in THIRD_PARTY_NOTICES.
 
-The frozen decoder core sources (src/core and src/cpu) carry no per-file licence headers: they are
-kept unchanged (code tokens pinned by their TOKENS.sha256, raw bytes by their SOURCES.sha256), and are
-covered by the top-level LICENSE.
+The decoder sources carry no per-file licence headers and are covered by LICENSE. The CPU
+sources and the three GPU files not named below retain the original comment-only provenance.
+
+Change notice (2026-10-30): Relay-BP modifies src/core/bp_engine.hpp, src/core/bp_gpu.cu and
+src/core/fastbpgpu6g.cpp, and adds configs/relay/ and tools/relay/. The regenerated core manifests
+pin the Relay-BP revision of the 79ee5e5 base. Mode off retains the original exactness contract;
+mode on is a new operating point.
+
+Relay-BP implements T. Müller et al., "Improved Belief Propagation Is Sufficient for Real-Time
+Decoding of Quantum Memory", arXiv:2506.01779 (2025), doi:10.48550/arXiv.2506.01779.
+IBM's reference implementation relay_bp / relay-bp (version 0.2.2), (C) Copyright IBM 2025,
+is licensed under Apache-2.0 (https://github.com/trmue/relay). No code was copied or translated
+from relay_bp; the port implements the published algorithm with eldpc's existing CUDA kernel.
+The gamma draws differ (SplitMix64 here versus StdRng in relay_bp), and relay_legs includes the
+initial leg, whereas relay_bp's num_sets counts subsequent legs. The comparison tools call
+relay_bp at run time; it is not vendored, linked or redistributed. It is installed separately
+under its own Apache-2.0 licence.

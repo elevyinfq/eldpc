@@ -1,14 +1,21 @@
 # eldpc architecture
 
+This branch pins the Relay-BP revision of base `79ee5e5` in `src/core/SOURCES.sha256` and
+`TOKENS.sha256`. Relay-BP is off by default (`relay=0`); with it off, the original exactness
+contract holds, checked against the base build and with the patch verification tools. With it on,
+it is a new operating point: GPU only, `decoder=bp`, round-to-nearest verification only.
+[RELAY_BP.md](RELAY_BP.md) documents every `relay*` key and a Python example. Historical build,
+identity and performance records below describe the original mode and their named revisions.
+
 This document describes how `eldpc` is built from its code: the layers a decode call passes
 through, what runs on the GPU and what runs on the host, how the two host builds of the decoder
 are chosen, what the libraries need from the CUDA driver at run time, and which build rules exist
 only to keep the outputs bit-identical.
 
-The decoder sources in `src/core/` are the `fastbpgpu6g` sources, identical to the benched sources
-except that development-history comments were neutralised (code tokens and line structure unchanged:
-`src/core/TOKENS.sha256`, checked by `tools/check_comment_only.py`; raw bytes: `src/core/SOURCES.sha256`;
-the libraries compiled from them are identical: `tools/results/comment-neutralisation/record.txt`). The package adds the Python layer (`python/eldpc/`), the C
+The decoder sources in `src/core/` are the Relay-BP revision of the `fastbpgpu6g` sources at
+base `79ee5e5`. The three modified files are `bp_engine.hpp`, `bp_gpu.cu` and `fastbpgpu6g.cpp`;
+the other three retain the original comment-only provenance. The current revision is pinned by
+`src/core/TOKENS.sha256` and `src/core/SOURCES.sha256`. The package adds the Python layer (`python/eldpc/`), the C
 API front (`src/port/eldpc_front.cpp`) and the build (`CMakeLists.txt`, `pyproject.toml`), plus
 the verification suite, the benchmark and the tuner in the source tree; the core files are not
 edited.
@@ -353,8 +360,10 @@ enforce this are in `CMakeLists.txt`:
   differ only in the code paths they enable.
 - **Pinned sources**: `src/core/SOURCES.sha256` lists the raw bytes of the six decoder sources and
   `src/core/TOKENS.sha256` the text without comments (`tools/check_comment_only.py`);
-  `tests/test_core_sources.py` and `tools/check_core_tarball.py` compare them with the snapshot
-  (the text without comments; the comments were neutralised). The core sources are never edited.
+  `tests/test_core_sources.py` and `tools/check_core_tarball.py` compare the unchanged three with
+  the original snapshot except comments. For the three Relay-BP files, they retain the original
+  snapshot hashes as provenance checks, separate from the current manifests. Keep this revision
+  frozen after the port.
 - **No I/O or environment in the core**: per the decoder ABI, the decode path performs no file,
   environment or process call. The only environment variable the package's own native code reads
   is `ELDPC_ISA`, once, in the front's load-time constructor; the CUDA driver and the statically

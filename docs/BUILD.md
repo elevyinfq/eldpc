@@ -1,5 +1,12 @@
 # Building eldpc
 
+This branch pins the Relay-BP revision of base `79ee5e5` in `src/core/SOURCES.sha256` and
+`TOKENS.sha256`. Relay-BP is off by default (`relay=0`); with it off, the original exactness
+contract holds, checked against the base build and with the patch verification tools. With it on,
+it is a new operating point: GPU only, `decoder=bp`, round-to-nearest verification only.
+[RELAY_BP.md](RELAY_BP.md) documents every `relay*` key and a Python example. Historical build,
+identity and performance records below describe the original mode and their named revisions.
+
 `eldpc` builds seven shared libraries with CMake, driven by scikit-build-core for `pip`:
 
 | library | contents |
@@ -525,12 +532,10 @@ available later reports the version at the next call.
 
 ## Check the decoder sources
 
-The six decoder sources in `src/core/` are identical to the benched sources of the decoder except
-that development-history comments were neutralised; code tokens and line structure are unchanged,
-and the libraries compiled from them are identical
-(`tools/results/comment-neutralisation/record.txt`). `src/core/SOURCES.sha256` lists the SHA-256
-values of their raw bytes and `src/core/TOKENS.sha256` those of their text without comments; from
-the package root:
+The six decoder sources in `src/core/` are pinned at the Relay-BP revision of base `79ee5e5`.
+`bp_engine.hpp`, `bp_gpu.cu` and `fastbpgpu6g.cpp` contain the new code; the other three retain
+the original comment-only provenance. `SOURCES.sha256` pins current raw bytes and `TOKENS.sha256`
+the current text without comments. From the package root:
 
 ```bash
 (cd src/core && sha256sum -c SOURCES.sha256)
@@ -545,7 +550,10 @@ python tools/check_core_tarball.py /path/to/fastbpgpu6g-src.tar.gz
 ```
 
 The tool reads the tarball in memory, finds each file under `candidates/fastbpgpu6g/` and
-compares its SHA-256 with the manifest; it exits non-zero on any mismatch.
+compares its comment-stripped SHA-256 with the original provenance pins: the current manifest
+for the three unchanged files, and the retained `79ee5e5` hashes for the three modified files.
+It exits non-zero on any mismatch. The optional snapshot test uses the same distinction; current
+modified files are checked separately against the regenerated manifests.
 
 ## Tests
 

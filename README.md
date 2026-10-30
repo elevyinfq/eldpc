@@ -9,6 +9,11 @@ The correction and the observable prediction of every shot are bit-identical to 
 BP+OSD-0 implementation at the same settings, and the status word is bit-identical to a separately
 built library of the same decoder sources.
 
+Relay-BP is also available as an optional GPU-only mode (`decoder=bp`, `relay > 0`), off by
+default. With it off, the original exactness contract holds, checked against the base build and
+with the patch verification tools. With it on, it is a new operating point. See
+[Relay-BP usage and config keys](docs/RELAY_BP.md).
+
 ## What eldpc is and is not
 
 **It is**
@@ -863,12 +868,12 @@ tests and skipped 4 (optional comparisons) in 15.5 s, at a revision before `--de
 
 ## Check the decoder sources
 
-`src/core/SOURCES.sha256` pins the raw bytes of the six decoder sources. They are identical to the
-benched sources except that development-history comments were neutralised: code tokens and line
-structure are unchanged (`src/core/TOKENS.sha256` and `src/cpu/TOKENS.sha256` pin the text without
-comments, checked by `tools/check_comment_only.py`), and the libraries compiled from them are
-identical (`tools/results/comment-neutralisation/record.txt`). From the repository root, these
-checks need nothing but the source tree:
+`src/core/SOURCES.sha256` pins the six sources of the Relay-BP revision of base `79ee5e5`;
+`src/core/TOKENS.sha256` pins their text without comments. Relay-BP changes `bp_engine.hpp`,
+`bp_gpu.cu` and `fastbpgpu6g.cpp`. The other three GPU sources and all CPU sources retain the
+original comment-only provenance. The snapshot and tarball checks compare those unchanged files
+to the original sources, and check the original hashes of the three modified snapshot files;
+they do not claim that the modified files differ only in comments. From the repository root:
 
 ```bash
 (cd src/core && sha256sum -c SOURCES.sha256)

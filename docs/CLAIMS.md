@@ -1,5 +1,12 @@
 # eldpc claims and their evidence
 
+This branch pins the Relay-BP revision of base `79ee5e5` in `src/core/SOURCES.sha256` and
+`TOKENS.sha256`. Relay-BP is off by default (`relay=0`); with it off, the original exactness
+contract holds, checked against the base build and with the patch verification tools. With it on,
+it is a new operating point: GPU only, `decoder=bp`, round-to-nearest verification only.
+[RELAY_BP.md](RELAY_BP.md) documents every `relay*` key and a Python example. Historical build,
+identity and performance records below describe the original mode and their named revisions.
+
 The headline claims first, each with the record that supports it; then every user-facing claim of
 [README.md](../README.md), one row each: the claim, the files in this repository that support it,
 its status, and what would refute it.
@@ -52,7 +59,7 @@ every machine, because the outputs are bit-identical.
 
 **Revisions.** A claim or a record that names a commit (for example revision `f44723c` in claim 2)
 names a revision of the development history this repository was released from. That history is
-not part of this repository, which starts at its release commit. The decoder-core sources in
+not part of this repository, which starts at its release commit. Before the Relay-BP revision, the decoder-core sources in
 `src/core/` and `src/cpu/` were not changed in that history except for the neutralisation of
 their comments before the release (`tools/results/comment-neutralisation/record.txt`;
 `python3 tools/check_comment_only.py --check` checks their code against `src/*/TOKENS.sha256`).

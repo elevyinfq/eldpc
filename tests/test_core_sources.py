@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The decoder sources: pinned by src/core/SOURCES.sha256 (raw bytes) and src/core/TOKENS.sha256
-(text with the comments removed: identical to the benched sources, which differ only in comments)."""
+(text with comments removed). The Relay-BP revision changes three files; the other three
+still differ from the original benched snapshot only in comments. Original hashes check the
+provenance of the three changed snapshot files, not equality to the current implementation."""
 
 from __future__ import annotations
 
@@ -67,18 +69,40 @@ def _comment_tool():
     return module
 
 
+def _original_relay_files():
+    spec = importlib.util.spec_from_file_location("check_core_tarball",
+                                                  PACKAGE / "tools" / "check_core_tarball.py")
+    module = importlib.util.module_from_spec(spec)
+    # check_core_tarball imports the shared comment lexer.
+    sys.path.insert(0, str(PACKAGE / "tools"))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module.ORIGINAL_RELAY_FILES
+
+
 @pytest.mark.skipif(not SNAPSHOT.is_dir(), reason="ELDPC_CORE_SNAPSHOT is not set to a directory")
 @pytest.mark.parametrize("name", SOURCES)
-def test_core_file_matches_the_snapshot_except_comments(name):
+def test_core_snapshot_provenance(name):
     tool = _comment_tool()
     ours = (CORE / name).read_bytes().decode("utf-8")
     theirs = (SNAPSHOT / name).read_bytes().decode("utf-8")
-    assert tool.strip_comments(ours) == tool.strip_comments(theirs), \
-        f"{name}: code tokens or line structure differ from {SNAPSHOT / name}"
+    original = _original_relay_files()
+    if name in original:
+        # These three contain new code. Check their original snapshot provenance;
+        # current bytes and tokens are checked against the regenerated manifests.
+        assert tool.stripped_sha256(theirs) == original[name], \
+            f"{name}: original snapshot provenance differs"
+        assert tool.strip_comments(ours) != tool.strip_comments(theirs), \
+            f"{name}: expected the Relay-BP revision to differ from the original snapshot"
+    else:
+        assert tool.strip_comments(ours) == tool.strip_comments(theirs), \
+            f"{name}: code tokens or line structure differ from {SNAPSHOT / name}"
 
 
 @pytest.mark.skipif(not TARBALL.is_file(), reason="ELDPC_CORE_TARBALL is not set to a file")
-def test_tarball_matches_manifest():
+def test_tarball_matches_original_provenance():
     proc = subprocess.run([sys.executable, str(PACKAGE / "tools" / "check_core_tarball.py"), str(TARBALL)],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
